@@ -1,0 +1,14 @@
+.git
+.github
+.env
+.env.*
+!.env.example
+.npm-cache
+node_modules
+dist
+coverage
+fixtures/raw
+*.har
+*.log
+README.md
+tests

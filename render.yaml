@@ -1,0 +1,32 @@
+services:
+  - type: web
+    name: tross-linkedin-profile-api
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    autoDeploy: false
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PUBLIC_API_KEY
+        sync: false
+      - key: LINKEDIN_COOKIE
+        sync: false
+      - key: LINKEDIN_CSRF_TOKEN
+        sync: false
+      - key: LINKEDIN_USER_AGENT
+        sync: false
+      - key: UPSTREAM_TIMEOUT_MS
+        value: '8000'
+      - key: REQUEST_DEADLINE_MS
+        value: '20000'
+      - key: UPSTREAM_CONCURRENCY
+        value: '2'
+      - key: SECTION_CACHE_TTL_SECONDS
+        value: '21600'
+      - key: PUBLIC_RATE_LIMIT_MAX
+        value: '60'
+      - key: PUBLIC_RATE_LIMIT_WINDOW_MS
+        value: '60000'
+      - key: LOG_LEVEL
+        value: info
