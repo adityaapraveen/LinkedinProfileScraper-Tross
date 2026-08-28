@@ -247,7 +247,7 @@ npm run protocol:replay
 npm run build
 ```
 
-Coverage includes URL normalization and malicious URLs, API keys, public error sanitization, entity indexing, partial extraction, cache hits/misses, bounded concurrency, authentication/checkpoint and HTML classification, rate limits, retries, circuit breaking, schema fingerprints, and fixture replay.
+Coverage includes URL normalization and malicious URLs, API keys, public error sanitization, entity indexing, partial extraction, cache hits/misses, bounded concurrency, authentication/checkpoint and HTML classification, rate limits, retries, circuit breaking, schema fingerprints, and fixture replay. GitHub Actions runs the complete offline verification suite and builds the production container without LinkedIn or deployment secrets.
 
 ## Docker usage
 
