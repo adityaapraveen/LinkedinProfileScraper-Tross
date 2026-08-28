@@ -1,10 +1,11 @@
 import { createApp } from './app.js';
+import { loadConfig } from './config.js';
 import { logger } from './infrastructure/logging/logger.js';
 
-const port = Number(process.env.PORT ?? 3000);
-const app = createApp();
-const server = app.listen(port, '0.0.0.0', () => {
-  logger.info({ port }, 'HTTP server listening');
+const config = loadConfig();
+const app = createApp(config);
+const server = app.listen(config.PORT, '0.0.0.0', () => {
+  logger.info({ port: config.PORT }, 'HTTP server listening');
 });
 
 server.requestTimeout = 30_000;

@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { createApp } from '../../src/app.js';
+import { loadConfig } from '../../src/config.js';
 
+const config = loadConfig({ NODE_ENV: 'test', PUBLIC_API_KEY: 'test-public-api-key' });
 const servers: Array<ReturnType<ReturnType<typeof createApp>['listen']>> = [];
 
 afterEach(async () => {
@@ -13,7 +15,7 @@ afterEach(async () => {
 
 describe('GET /health', () => {
   it('returns service health without authentication', async () => {
-    const server = createApp().listen(0);
+    const server = createApp(config).listen(0);
     servers.push(server);
     await new Promise<void>((resolve) => server.once('listening', resolve));
     const address = server.address();
