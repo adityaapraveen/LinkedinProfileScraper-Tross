@@ -6,11 +6,13 @@ import { profileSections } from './domain/profile.js';
 import { MemoryCache } from './infrastructure/cache/memory-cache.js';
 import { LinkedInClient } from './linkedin/client/linkedin-client.js';
 import { SessionHealth } from './linkedin/client/session-health.js';
+import { DriftMonitor } from './linkedin/diagnostics/drift-monitor.js';
 import { resolveProfile } from './linkedin/operations/resolve-profile.js';
 
 export function createDependencies(config: AppConfig): AppDependencies {
   const client = LinkedInClient.fromConfig(config);
   const sessionHealth = client?.sessionHealth ?? new SessionHealth(false);
+  const driftMonitor = new DriftMonitor();
   const profileExtractor = new ExtractProfileUseCase({
     cache: new MemoryCache(),
     resolver: {
@@ -34,12 +36,7 @@ export function createDependencies(config: AppConfig): AppDependencies {
     upstreamHealthReader: {
       getHealth: () => ({
         session: sessionHealth.snapshot(),
-        operations: Object.fromEntries(
-          profileSections.map((section) => [
-            section,
-            { status: 'unknown', lastSuccessAt: null, schemaDrift: false },
-          ]),
-        ),
+        operations: driftMonitor.snapshot(profileSections),
       }),
     },
   };
