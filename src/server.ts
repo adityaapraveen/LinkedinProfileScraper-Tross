@@ -1,9 +1,10 @@
 import { createApp } from './app.js';
 import { loadConfig } from './config.js';
+import { createDependencies } from './composition.js';
 import { logger } from './infrastructure/logging/logger.js';
 
 const config = loadConfig();
-const app = createApp(config);
+const app = createApp(config, createDependencies(config));
 const server = app.listen(config.PORT, '0.0.0.0', () => {
   logger.info({ port: config.PORT }, 'HTTP server listening');
 });
