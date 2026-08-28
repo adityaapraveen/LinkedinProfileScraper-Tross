@@ -1,0 +1,323 @@
+openapi: 3.1.0
+info:
+  title: Tross LinkedIn Profile Extraction API
+  version: 0.1.0
+  description: >-
+    Drift-aware API that normalizes visible LinkedIn profile data obtained through verified,
+    reverse-engineered direct HTTP endpoints. No browser or DOM scraping is used at runtime.
+servers:
+  - url: https://your-render-service.example
+    description: Replace with the deployed HTTPS origin
+  - url: http://localhost:3000
+    description: Local development
+paths:
+  /health:
+    get:
+      summary: Service health
+      operationId: getHealth
+      responses:
+        '200':
+          description: Process is accepting requests
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+  /v1/profiles/extract:
+    post:
+      summary: Extract a LinkedIn profile
+      operationId: extractProfile
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ExtractRequest'
+      responses:
+        '200':
+          description: Complete or partial normalized profile result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExtractResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/Unsupported'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '502':
+          $ref: '#/components/responses/BadGateway'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /v1/upstream/health:
+    get:
+      summary: Safe LinkedIn protocol health
+      operationId: getUpstreamHealth
+      security:
+        - ApiKeyAuth: []
+      responses:
+        '200':
+          description: Session and operation compatibility status; never includes secrets or profile data
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpstreamHealth'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+  responses:
+    BadRequest:
+      description: Invalid request or profile URL
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    Unauthorized:
+      description: Missing or invalid public API key
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    NotFound:
+      description: Profile not found
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    Unsupported:
+      description: Unsupported LinkedIn URL
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    RateLimited:
+      description: Public API rate limit exceeded
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    BadGateway:
+      description: Rejected, malformed, or incompatible upstream response
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    Unavailable:
+      description: Session, endpoint, rate-limit, timeout, or temporary upstream failure
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+  schemas:
+    Health:
+      type: object
+      additionalProperties: false
+      required: [status, timestamp]
+      properties:
+        status: { type: string, const: ok }
+        timestamp: { type: string, format: date-time }
+    ProfileSection:
+      type: string
+      enum: [identity, experience, education, skills, certifications, languages]
+    ExtractRequest:
+      type: object
+      additionalProperties: false
+      required: [url]
+      properties:
+        url:
+          type: string
+          format: uri
+          example: https://www.linkedin.com/in/synthetic-profile/
+        sections:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          items: { $ref: '#/components/schemas/ProfileSection' }
+        freshness:
+          type: string
+          enum: [prefer-cache, live]
+          default: prefer-cache
+    NullableDate:
+      oneOf:
+        - type: 'null'
+        - type: object
+          additionalProperties: false
+          required: [year, month]
+          properties:
+            year: { type: [integer, 'null'] }
+            month: { type: [integer, 'null'], minimum: 1, maximum: 12 }
+    Identity:
+      type: object
+      additionalProperties: false
+      required: [name, firstName, lastName, headline, location, about, images]
+      properties:
+        name: { type: [string, 'null'] }
+        firstName: { type: [string, 'null'] }
+        lastName: { type: [string, 'null'] }
+        headline: { type: [string, 'null'] }
+        location: { type: [string, 'null'] }
+        about: { type: [string, 'null'] }
+        images:
+          type: object
+          additionalProperties: false
+          required: [profile, background]
+          properties:
+            profile: { type: [string, 'null'], format: uri }
+            background: { type: [string, 'null'], format: uri }
+    Experience:
+      type: object
+      additionalProperties: false
+      required:
+        [title, company, employmentType, location, description, startDate, endDate, isCurrent]
+      properties:
+        title: { type: [string, 'null'] }
+        company: { type: [string, 'null'] }
+        employmentType: { type: [string, 'null'] }
+        location: { type: [string, 'null'] }
+        description: { type: [string, 'null'] }
+        startDate: { $ref: '#/components/schemas/NullableDate' }
+        endDate: { $ref: '#/components/schemas/NullableDate' }
+        isCurrent: { type: boolean }
+    Education:
+      type: object
+      additionalProperties: false
+      required: [school, degree, fieldOfStudy, startYear, endYear, description]
+      properties:
+        school: { type: [string, 'null'] }
+        degree: { type: [string, 'null'] }
+        fieldOfStudy: { type: [string, 'null'] }
+        startYear: { type: [integer, 'null'] }
+        endYear: { type: [integer, 'null'] }
+        description: { type: [string, 'null'] }
+    Certification:
+      type: object
+      additionalProperties: false
+      required: [name, authority, issuedAt, expiresAt, credentialId, credentialUrl]
+      properties:
+        name: { type: [string, 'null'] }
+        authority: { type: [string, 'null'] }
+        issuedAt: { type: [string, 'null'] }
+        expiresAt: { type: [string, 'null'] }
+        credentialId: { type: [string, 'null'] }
+        credentialUrl: { type: [string, 'null'], format: uri }
+    CanonicalProfile:
+      type: object
+      additionalProperties: false
+      required: [profileUrl, identity, experience, education, skills, certifications, languages]
+      properties:
+        profileUrl: { type: string, format: uri }
+        identity:
+          oneOf:
+            - type: 'null'
+            - $ref: '#/components/schemas/Identity'
+        experience:
+          type: array
+          items: { $ref: '#/components/schemas/Experience' }
+        education:
+          type: array
+          items: { $ref: '#/components/schemas/Education' }
+        skills:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            required: [name]
+            properties:
+              name: { type: string }
+        certifications:
+          type: array
+          items: { $ref: '#/components/schemas/Certification' }
+        languages:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            required: [name, proficiency]
+            properties:
+              name: { type: string }
+              proficiency: { type: [string, 'null'] }
+    SectionMetadata:
+      type: object
+      additionalProperties: false
+      required: [status, durationMs]
+      properties:
+        status: { type: string, enum: [success, failed] }
+        source: { type: string }
+        error:
+          type: string
+          enum:
+            [
+              INVALID_PROFILE_URL,
+              UNSUPPORTED_PROFILE_URL,
+              PROFILE_NOT_FOUND,
+              SESSION_UNAVAILABLE,
+              SESSION_CHALLENGE,
+              UPSTREAM_RATE_LIMITED,
+              UPSTREAM_TIMEOUT,
+              UPSTREAM_UNAVAILABLE,
+              UPSTREAM_REJECTED,
+              UPSTREAM_SCHEMA_CHANGED,
+              SECTION_UNAVAILABLE,
+              INTERNAL_ERROR,
+            ]
+        durationMs: { type: integer, minimum: 0 }
+    ExtractResponse:
+      type: object
+      additionalProperties: false
+      required: [profile, meta]
+      properties:
+        profile: { $ref: '#/components/schemas/CanonicalProfile' }
+        meta:
+          type: object
+          additionalProperties: false
+          required: [partial, retrievedAt, cached, sections]
+          properties:
+            partial: { type: boolean }
+            retrievedAt: { type: string, format: date-time }
+            cached: { type: boolean }
+            sections:
+              type: object
+              additionalProperties: { $ref: '#/components/schemas/SectionMetadata' }
+    UpstreamHealth:
+      type: object
+      additionalProperties: false
+      required: [session, operations]
+      properties:
+        session:
+          type: object
+          additionalProperties: false
+          required: [status, lastValidatedAt]
+          properties:
+            status: { type: string, enum: [unknown, healthy, unavailable, challenge] }
+            lastValidatedAt: { type: [string, 'null'], format: date-time }
+        operations:
+          type: object
+          additionalProperties:
+            type: object
+            additionalProperties: false
+            required: [status, lastSuccessAt, schemaDrift]
+            properties:
+              status:
+                {
+                  type: string,
+                  enum: [healthy, compatible_drift, breaking_drift, session_failure, unknown],
+                }
+              lastSuccessAt: { type: [string, 'null'], format: date-time }
+              schemaDrift: { type: boolean }
+    ErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code: { type: string }
+            message: { type: string }
+            details: { type: array }
