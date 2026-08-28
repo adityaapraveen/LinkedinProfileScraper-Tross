@@ -176,6 +176,10 @@ LinkedIn session material is supplied externally; automatic username/password lo
 
 A `401`, `403`, or detected login/checkpoint HTML response marks the session unhealthy and opens an in-process circuit breaker. New upstream requests fail safely with `SESSION_UNAVAILABLE`. Replace deployment secrets and restart the process to restore health. Session cookies expire and require manual rotation. Visible data depends on the authenticated session and LinkedIn visibility rules.
 
+## Structured logging
+
+Pino emits request IDs, operation names, durations, cache hits, section status, safe error codes, session-health transitions, and schema-drift classifications. Profile contents, raw upstream bodies, cookies, CSRF values, authorization headers, and API keys are never intentionally logged. Section logs are emitted from the request-scoped logger so they retain the HTTP request ID.
+
 ## Retry policy
 
 At most one retry is made, with exponential delay and jitter, for a timeout/network failure or temporary upstream `502`/`503`. Authentication failures, checkpoints, `429`, profile-not-found responses, parser failures, and schema drift are not retried. A strict operation timeout and extraction deadline bound work.

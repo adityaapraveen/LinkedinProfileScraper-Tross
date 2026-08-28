@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { DriftMonitor } from '../../src/linkedin/diagnostics/drift-monitor.js';
 
 describe('DriftMonitor', () => {
@@ -25,5 +25,16 @@ describe('DriftMonitor', () => {
     const successfulAt = monitor.snapshot(['identity']).identity.lastSuccessAt;
     monitor.record('identity', 'breaking_drift');
     expect(monitor.snapshot(['identity']).identity.lastSuccessAt).toBe(successfulAt);
+  });
+
+  it('emits only safe compatibility observations', () => {
+    const observer = vi.fn();
+    const monitor = new DriftMonitor(observer);
+    monitor.record('skills', 'breaking_drift');
+    expect(observer).toHaveBeenCalledWith({
+      section: 'skills',
+      status: 'breaking_drift',
+      schemaDrift: true,
+    });
   });
 });

@@ -67,7 +67,7 @@ export class LinkedInClient {
     this.sessionHealth = options.sessionHealth ?? new SessionHealth(true);
   }
 
-  static fromConfig(config: AppConfig): LinkedInClient | null {
+  static fromConfig(config: AppConfig, sessionHealth?: SessionHealth): LinkedInClient | null {
     if (!config.LINKEDIN_COOKIE || !config.LINKEDIN_CSRF_TOKEN || !config.LINKEDIN_USER_AGENT) {
       return null;
     }
@@ -76,6 +76,7 @@ export class LinkedInClient {
       csrfToken: config.LINKEDIN_CSRF_TOKEN,
       userAgent: config.LINKEDIN_USER_AGENT,
       timeoutMs: config.UPSTREAM_TIMEOUT_MS,
+      ...(sessionHealth ? { sessionHealth } : {}),
     });
   }
 

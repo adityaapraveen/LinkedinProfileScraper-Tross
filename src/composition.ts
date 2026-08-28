@@ -1,18 +1,33 @@
 import type { AppDependencies } from './app.js';
 import { ExtractProfileUseCase } from './application/extract-profile.use-case.js';
-import type { AppConfig } from './config.js';
+import { hasLinkedInSession, type AppConfig } from './config.js';
 import { DomainError } from './domain/errors.js';
 import { profileSections } from './domain/profile.js';
 import { MemoryCache } from './infrastructure/cache/memory-cache.js';
+import { logger } from './infrastructure/logging/logger.js';
 import { LinkedInClient } from './linkedin/client/linkedin-client.js';
 import { SessionHealth } from './linkedin/client/session-health.js';
 import { DriftMonitor } from './linkedin/diagnostics/drift-monitor.js';
 import { resolveProfile } from './linkedin/operations/resolve-profile.js';
 
 export function createDependencies(config: AppConfig): AppDependencies {
-  const client = LinkedInClient.fromConfig(config);
-  const sessionHealth = client?.sessionHealth ?? new SessionHealth(false);
-  const driftMonitor = new DriftMonitor();
+  const sessionHealth = new SessionHealth(hasLinkedInSession(config), (transition) => {
+    logger.info(
+      { from: transition.from, to: transition.to, transitionedAt: transition.at },
+      'LinkedIn session health transitioned',
+    );
+  });
+  const client = LinkedInClient.fromConfig(config, sessionHealth);
+  const driftMonitor = new DriftMonitor((observation) => {
+    logger.info(
+      {
+        operation: observation.section,
+        driftStatus: observation.status,
+        schemaDrift: observation.schemaDrift,
+      },
+      'LinkedIn schema compatibility observed',
+    );
+  });
   const profileExtractor = new ExtractProfileUseCase({
     cache: new MemoryCache(),
     resolver: {

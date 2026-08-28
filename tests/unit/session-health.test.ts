@@ -1,6 +1,9 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { DomainError } from '../../src/domain/errors.js';
-import { SessionHealth } from '../../src/linkedin/client/session-health.js';
+import {
+  SessionHealth,
+  type SessionHealthObserver,
+} from '../../src/linkedin/client/session-health.js';
 
 describe('SessionHealth', () => {
   it('opens the circuit after authentication failure', () => {
@@ -20,5 +23,20 @@ describe('SessionHealth', () => {
     health.markHealthy();
     expect(health.snapshot()).toMatchObject({ status: 'healthy' });
     expect(health.snapshot().lastValidatedAt).not.toBeNull();
+  });
+
+  it('emits safe status transitions without session material', () => {
+    const observer = vi.fn<SessionHealthObserver>();
+    const health = new SessionHealth(true, observer);
+    health.markHealthy();
+    health.markHealthy();
+    health.markAuthenticationFailure(true);
+
+    expect(observer).toHaveBeenCalledTimes(2);
+    expect(observer.mock.calls.map(([transition]) => transition)).toMatchObject([
+      { from: 'unknown', to: 'healthy' },
+      { from: 'healthy', to: 'challenge' },
+    ]);
+    expect(JSON.stringify(observer.mock.calls)).not.toContain('cookie');
   });
 });

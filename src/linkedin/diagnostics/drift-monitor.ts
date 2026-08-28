@@ -7,19 +7,31 @@ export interface OperationHealth {
   schemaDrift: boolean;
 }
 
+export interface DriftObservation {
+  section: ProfileSection;
+  status: DriftStatus;
+  schemaDrift: boolean;
+}
+
+export type DriftObserver = (observation: DriftObservation) => void;
+
 export class DriftMonitor {
   private readonly operations = new Map<ProfileSection, OperationHealth>();
 
+  constructor(private readonly observer?: DriftObserver) {}
+
   record(section: ProfileSection, status: DriftStatus): void {
     const previous = this.operations.get(section);
-    this.operations.set(section, {
+    const health = {
       status,
       lastSuccessAt:
         status === 'healthy' || status === 'compatible_drift'
           ? new Date().toISOString()
           : (previous?.lastSuccessAt ?? null),
       schemaDrift: status === 'compatible_drift' || status === 'breaking_drift',
-    });
+    } satisfies OperationHealth;
+    this.operations.set(section, health);
+    this.observer?.({ section, status, schemaDrift: health.schemaDrift });
   }
 
   snapshot(sections: readonly ProfileSection[]): Record<ProfileSection, OperationHealth> {
