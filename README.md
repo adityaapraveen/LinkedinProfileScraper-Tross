@@ -211,6 +211,29 @@ npm run protocol:replay
 
 The command discovers sanitized fixtures, invokes the registered parser, compares canonical output to `expected.json`, computes a fingerprint, compares metadata, prints a compatibility report, and exits non-zero for an unavailable parser or golden-output failure. At present it reports that no fixtures exist because no verified response has been supplied.
 
+Raw responses must remain under ignored `fixtures/raw/`. The sanitizer fails closed unless every non-boolean scalar is explicitly replaced or preserved by JSON path; it automatically redacts secret-bearing keys and refuses to overwrite its input:
+
+```bash
+npm run protocol:sanitize -- \
+  fixtures/raw/upstream.json \
+  fixtures/sanitized/identity/standard/upstream.json \
+  fixtures/raw/sanitization-policy.json
+```
+
+A policy has the shape below. Replacement values must retain the original JSON type. `$type`, booleans, and `null` are structurally preserved; every explicit `preservePaths` entry must be privacy-reviewed.
+
+```json
+{
+  "replacements": {
+    "$.included[0].firstName": "Synthetic",
+    "$.included[0].entityUrn": "urn:li:fsd_profile:SYNTHETIC_1"
+  },
+  "preservePaths": ["$.data.paging.total"]
+}
+```
+
+The generated file still requires manual privacy review before it is staged.
+
 ## Testing
 
 All upstream HTTP calls are mocked. No live integration test runs in CI by default.

@@ -17,7 +17,8 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
-    "protocol:replay": "tsx tools/replay-fixtures.ts"
+    "protocol:replay": "tsx tools/replay-fixtures.ts",
+    "protocol:sanitize": "tsx tools/sanitize-fixture.ts"
   },
   "dependencies": {
     "express": "^5.1.0",
