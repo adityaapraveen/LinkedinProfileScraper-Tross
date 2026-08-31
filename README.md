@@ -34,9 +34,7 @@ The protocol integration has been live-tested against LinkedIn's `FullProfileWit
 - [Observability and drift detection](#observability-and-drift-detection)
 - [Testing](#testing)
 - [Docker usage](#docker-usage)
-- [Deployment on Render](#deployment-on-render)
-- [Deployment on Railway](#deployment-on-railway)
-- [Testing the hosted Railway API](#testing-the-hosted-railway-api)
+- [Use the hosted API](#use-the-hosted-api)
 - [Troubleshooting](#troubleshooting)
 - [Security and privacy](#security-and-privacy)
 - [Architecture tradeoffs](#architecture-tradeoffs)
@@ -521,7 +519,7 @@ npm run build
 node --env-file=.env dist/server.js
 ```
 
-`npm start` expects a production environment such as Render or Docker to inject variables. The explicit Node command above loads `.env` for a local production build.
+`npm start` expects the production environment or container runtime to inject variables. The explicit Node command above loads `.env` for a local production build.
 
 ## Environment variables
 
@@ -888,165 +886,48 @@ The Dockerfile uses a build stage for TypeScript and a smaller production stage 
 
 Never pass credentials as Docker build arguments; build metadata and layers are not secret stores.
 
-## Deployment on Render
+## Use the hosted API
 
-The repository contains `render.yaml` and a production Dockerfile.
-
-1. Push the repository to GitHub.
-2. Create a Render Web Service or Blueprint.
-3. Select the completed branch.
-4. Use the included Dockerfile.
-5. Configure `PUBLIC_API_KEY`, `LINKEDIN_COOKIE`, `LINKEDIN_CSRF_TOKEN`, and `LINKEDIN_USER_AGENT` as Render secrets.
-6. Keep `NODE_ENV=production`.
-7. Set `/health` as the health-check path.
-8. Deploy and verify health.
-9. Perform one permitted live extraction.
-
-Render provides HTTPS. Replace the placeholder server URL in `openapi.yaml` with the deployed origin when available.
-
-When the LinkedIn session expires, rotate all three session secrets together, restart/redeploy, and perform one live validation.
-
-## Deployment on Railway
-
-Railway can deploy this repository directly from GitHub using the production Dockerfile. A Blueprint, database, volume, custom build command, and custom start command are not required.
-
-Railway's pricing and trial rules can change. At the time this guide was written, a new account received a time-limited trial credit and could then use a smaller monthly Free-plan credit. Check the current [Railway pricing](https://railway.com/pricing) and [Free Trial documentation](https://docs.railway.com/pricing/free-trial) before deploying. Use Serverless mode for a low-traffic demonstration so an inactive service can sleep instead of continuously consuming compute credit.
-
-### 1. Verify outbound-network eligibility
-
-The adapter must make outbound HTTPS requests to LinkedIn. Railway distinguishes between a Full Trial and a Limited Trial; a Limited Trial can restrict outbound networking. Sign in with GitHub and check [Railway verification](https://railway.com/verify) before diagnosing an upstream timeout as an application defect.
-
-### 2. Create the service
-
-1. Sign in to Railway with GitHub.
-2. Select **New Project**.
-3. Select **Deploy from GitHub repo**.
-4. Select this repository.
-5. Select the branch containing the completed implementation.
-6. Deploy the service.
-
-Railway should detect the root `Dockerfile` automatically. Confirm these settings under the service's **Settings** tab:
-
-| Setting              | Value                         |
-| -------------------- | ----------------------------- |
-| Builder              | Dockerfile                    |
-| Dockerfile path      | `Dockerfile` or `/Dockerfile` |
-| Root directory       | `/`                           |
-| Custom build command | Empty                         |
-| Custom start command | Empty                         |
-| Health-check path    | `/health`                     |
-| Health-check timeout | Default is sufficient         |
-| Restart policy       | On Failure                    |
-| Replicas             | `1`                           |
-
-The Dockerfile's `CMD` starts `node dist/server.js`. Do not configure `npm run dev`: development mode runs a file watcher and is not the production entry point.
-
-Railway injects `PORT`. Do not create or hardcode it. The server already reads `process.env.PORT` and binds to `0.0.0.0`, which allows Railway's proxy and health check to reach it.
-
-### 3. Configure variables
-
-Open **Service -> Variables** and add these values individually:
-
-| Variable                      | Required | Purpose                                              |
-| ----------------------------- | -------- | ---------------------------------------------------- |
-| `PUBLIC_API_KEY`              | Yes      | Authenticates callers of the public Tross API        |
-| `LINKEDIN_COOKIE`             | Yes      | Complete authorized LinkedIn Cookie header value     |
-| `LINKEDIN_CSRF_TOKEN`         | Yes      | `JSESSIONID` value without surrounding double quotes |
-| `LINKEDIN_USER_AGENT`         | Yes      | User agent associated with the captured session      |
-| `NODE_ENV`                    | Yes      | Set to `production`                                  |
-| `UPSTREAM_TIMEOUT_MS`         | No       | Defaults to `8000`                                   |
-| `REQUEST_DEADLINE_MS`         | No       | Defaults to `20000`                                  |
-| `UPSTREAM_CONCURRENCY`        | No       | Defaults to `2`                                      |
-| `SECTION_CACHE_TTL_SECONDS`   | No       | Defaults to `21600`                                  |
-| `PUBLIC_RATE_LIMIT_MAX`       | No       | Defaults to `60`                                     |
-| `PUBLIC_RATE_LIMIT_WINDOW_MS` | No       | Defaults to `60000`                                  |
-| `LOG_LEVEL`                   | No       | Defaults to `info`                                   |
-
-Generate a strong API key rather than using a predictable value:
-
-```bash
-openssl rand -hex 32
-```
-
-The `PUBLIC_API_KEY` name means the key protects the public-facing API; it does **not** mean the value is safe to publish. Treat it as an authentication credential.
-
-For Railway's individual variable field, paste the cookie value without the outer single quotes used by a local `.env` file. Preserve any double quotes inside the cookie:
+The API is already deployed. Its public health URL is:
 
 ```text
-li_at=REDACTED; JSESSIONID="ajax:REDACTED"; other_cookie=REDACTED
-```
-
-If the cookie contains:
-
-```text
-JSESSIONID="ajax:123456789"
-```
-
-then the matching CSRF variable is:
-
-```text
-LINKEDIN_CSRF_TOKEN=ajax:123456789
-```
-
-The three LinkedIn session variables must be configured together. After validating the deployment, use Railway's **Seal** action for the API key and LinkedIn session variables. Keep a separate secure copy because a sealed Railway variable cannot be viewed or unsealed.
-
-### 4. Deploy and inspect logs
-
-Variable changes are staged in Railway. Review the changes and select **Deploy**. A successful boot includes an `HTTP server listening` log. If the first deployment occurred before variables were added, configuration validation may have failed; redeploy after completing the variables.
-
-Configure `/health` under **Settings -> Deploy -> Healthcheck**. Railway uses this check while promoting a deployment. The endpoint deliberately checks process readiness only; it does not make a LinkedIn request.
-
-### 5. Generate the public domain
-
-Open **Settings -> Networking -> Public Networking**, select **Generate Domain**, and use the resulting HTTPS `*.up.railway.app` origin. Railway services do not necessarily receive a public domain merely because the container deployed. See the [Railway public networking guide](https://docs.railway.com/networking/public-networking).
-
-### 6. Conserve Free-plan credit
-
-For a low-traffic challenge/demo deployment:
-
-1. Open **Settings -> Deploy -> Serverless**.
-2. Enable Serverless.
-3. Redeploy so the setting applies to the new container.
-4. Keep one replica and begin with conservative CPU/memory limits.
-5. Configure usage notifications and a hard usage limit if available.
-
-Serverless determines inactivity from outbound traffic and wakes the service on an incoming request. The first request after sleep can be slow and can occasionally receive a Railway `502`; call `/health`, wait for `200`, and retry. Sleeping or restarting also clears this project's in-memory cache and health history. See [Railway Serverless](https://docs.railway.com/deployments/serverless) and [cost controls](https://docs.railway.com/pricing/cost-control).
-
-### 7. Railway deployment checklist
-
-```text
-Source:                GitHub repository
-Builder:               Dockerfile
-Dockerfile:            /Dockerfile
-Root directory:        /
-Build command:         empty
-Start command:         empty
-Health check:          /health
-Public networking:     generated Railway domain
-Serverless:            enabled for a low-traffic demo
-Replicas:              1
-PORT:                  supplied by Railway; do not set
-```
-
-## Testing the hosted Railway API
-
-The current demonstration origin is:
-
-```text
-https://linkedinprofilescraper-tross-production.up.railway.app
+https://linkedinprofilescraper-tross-production.up.railway.app/health
 ```
 
 This is an API-only service. The root path `/` is not a website and may return `404` or `Cannot GET /`. Use the documented routes below.
 
-Do not put `li_at`, the LinkedIn cookie, or the CSRF token in client requests. Those credentials remain in Railway. A client sends only the separately issued Tross API key.
+The public demonstration API key is:
 
-### 1. Verify process health
+```text
+1234567890asdfgh
+```
+
+This key is intentionally published for challenge evaluation. Anyone with it can consume the hosted service's rate and compute allowance, so the operator should rotate or disable it after the evaluation period.
+
+Consumers do not need to configure `li_at`, the LinkedIn cookie, the CSRF token, the user agent, Node.js, or this repository. Those server-side values are already configured on the hosted deployment and must never be sent by an API consumer.
+
+### 1. Set the client environment variables
+
+Copy and paste these commands into Bash or Zsh:
+
+```bash
+export TROSS_API_BASE_URL='https://linkedinprofilescraper-tross-production.up.railway.app'
+export TROSS_API_KEY='1234567890asdfgh'
+```
+
+These are the only environment variables needed to call the hosted API. Confirm them without printing the key:
+
+```bash
+test -n "$TROSS_API_BASE_URL" && test -n "$TROSS_API_KEY" && echo 'Tross client variables are set'
+```
+
+### 2. Verify process health
 
 No API key is required:
 
 ```bash
 curl --request GET \
-  'https://linkedinprofilescraper-tross-production.up.railway.app/health'
+  "$TROSS_API_BASE_URL/health"
 ```
 
 Expected shape:
@@ -1060,25 +941,11 @@ Expected shape:
 
 This proves the container, Node process, port binding, Railway routing, and Express application are available. It does not validate the LinkedIn session.
 
-### 2. Supply the Tross API key safely
-
-Obtain the current demo API key from the service operator. Do not commit it to this repository. Store it in a task-specific shell variable for the current terminal:
-
-```bash
-export TROSS_API_KEY='replace-with-the-issued-demo-key'
-```
-
-Remove it when finished:
-
-```bash
-unset TROSS_API_KEY
-```
-
 ### 3. Inspect upstream health
 
 ```bash
 curl --request GET \
-  'https://linkedinprofilescraper-tross-production.up.railway.app/v1/upstream/health' \
+  "$TROSS_API_BASE_URL/v1/upstream/health" \
   --header "X-API-Key: $TROSS_API_KEY"
 ```
 
@@ -1088,16 +955,16 @@ Before the first live extraction, a configured session can be `unknown`. A succe
 
 ```bash
 curl --request POST \
-  'https://linkedinprofilescraper-tross-production.up.railway.app/v1/profiles/extract' \
+  "$TROSS_API_BASE_URL/v1/profiles/extract" \
   --header "X-API-Key: $TROSS_API_KEY" \
   --header 'Content-Type: application/json' \
   --data '{
-    "url": "https://www.linkedin.com/in/example-profile/",
+    "url": "https://www.linkedin.com/in/aditya-praveen-39263924a/",
     "freshness": "live"
   }'
 ```
 
-Replace the example with an authorized LinkedIn `/in/{slug}` URL. `live` skips cache reads, performs the permitted upstream request, and refreshes successful cache entries. Avoid repeated live calls when `prefer-cache` is sufficient.
+Replace the profile URL only when testing another authorized LinkedIn `/in/{slug}` profile. `live` skips cache reads, performs the permitted upstream request, and refreshes successful cache entries. Avoid repeated live calls when `prefer-cache` is sufficient.
 
 ### 5. Verify the cache
 
@@ -1105,11 +972,11 @@ After a successful live request, repeat it with cache preference:
 
 ```bash
 curl --request POST \
-  'https://linkedinprofilescraper-tross-production.up.railway.app/v1/profiles/extract' \
+  "$TROSS_API_BASE_URL/v1/profiles/extract" \
   --header "X-API-Key: $TROSS_API_KEY" \
   --header 'Content-Type: application/json' \
   --data '{
-    "url": "https://www.linkedin.com/in/example-profile/",
+    "url": "https://www.linkedin.com/in/aditya-praveen-39263924a/",
     "freshness": "prefer-cache"
   }'
 ```
@@ -1120,11 +987,11 @@ Look for `meta.cached: true`. A Railway sleep, restart, or deployment clears the
 
 ```bash
 curl --request POST \
-  'https://linkedinprofilescraper-tross-production.up.railway.app/v1/profiles/extract' \
+  "$TROSS_API_BASE_URL/v1/profiles/extract" \
   --header "X-API-Key: $TROSS_API_KEY" \
   --header 'Content-Type: application/json' \
   --data '{
-    "url": "https://www.linkedin.com/in/example-profile/",
+    "url": "https://www.linkedin.com/in/aditya-praveen-39263924a/",
     "sections": ["identity", "experience"],
     "freshness": "prefer-cache"
   }'
@@ -1138,11 +1005,11 @@ Pipe a response through `jq`:
 
 ```bash
 curl --silent --request POST \
-  'https://linkedinprofilescraper-tross-production.up.railway.app/v1/profiles/extract' \
+  "$TROSS_API_BASE_URL/v1/profiles/extract" \
   --header "X-API-Key: $TROSS_API_KEY" \
   --header 'Content-Type: application/json' \
   --data '{
-    "url": "https://www.linkedin.com/in/example-profile/",
+    "url": "https://www.linkedin.com/in/aditya-praveen-39263924a/",
     "freshness": "prefer-cache"
   }' | jq
 ```
@@ -1159,23 +1026,79 @@ https://linkedinprofilescraper-tross-production.up.railway.app/v1/profiles/extra
 
 Configure these headers:
 
-| Header         | Value                         |
-| -------------- | ----------------------------- |
-| `X-API-Key`    | The issued Tross demo API key |
-| `Content-Type` | `application/json`            |
+| Header         | Value              |
+| -------------- | ------------------ |
+| `X-API-Key`    | `1234567890asdfgh` |
+| `Content-Type` | `application/json` |
 
 Choose **Body -> raw -> JSON** and enter:
 
 ```json
 {
-  "url": "https://www.linkedin.com/in/example-profile/",
+  "url": "https://www.linkedin.com/in/aditya-praveen-39263924a/",
   "freshness": "live"
 }
 ```
 
 ### 9. Verify public error behavior
 
-Useful negative tests include:
+#### Missing API key
+
+```bash
+curl --include --request POST \
+  "$TROSS_API_BASE_URL/v1/profiles/extract" \
+  --header 'Content-Type: application/json' \
+  --data '{
+    "url": "https://www.linkedin.com/in/aditya-praveen-39263924a/"
+  }'
+```
+
+Expected: HTTP `401` with error code `UNAUTHORIZED`.
+
+#### Incorrect API key
+
+```bash
+curl --include --request POST \
+  "$TROSS_API_BASE_URL/v1/profiles/extract" \
+  --header 'X-API-Key: deliberately-wrong-key' \
+  --header 'Content-Type: application/json' \
+  --data '{
+    "url": "https://www.linkedin.com/in/aditya-praveen-39263924a/"
+  }'
+```
+
+Expected: HTTP `401` with error code `UNAUTHORIZED`.
+
+#### Unsupported profile URL
+
+```bash
+curl --include --request POST \
+  "$TROSS_API_BASE_URL/v1/profiles/extract" \
+  --header "X-API-Key: $TROSS_API_KEY" \
+  --header 'Content-Type: application/json' \
+  --data '{
+    "url": "https://example.com/not-linkedin"
+  }'
+```
+
+Expected: HTTP `422` with error code `UNSUPPORTED_PROFILE_URL`.
+
+#### Unsupported section
+
+```bash
+curl --include --request POST \
+  "$TROSS_API_BASE_URL/v1/profiles/extract" \
+  --header "X-API-Key: $TROSS_API_KEY" \
+  --header 'Content-Type: application/json' \
+  --data '{
+    "url": "https://www.linkedin.com/in/aditya-praveen-39263924a/",
+    "sections": ["posts"]
+  }'
+```
+
+Expected: HTTP `400` request validation failure.
+
+Useful expected behaviors include:
 
 - Omit `X-API-Key`: expect `401 UNAUTHORIZED`.
 - Send an incorrect API key: expect `401 UNAUTHORIZED`.
@@ -1194,6 +1117,15 @@ GET  /health
 ```
 
 For a demonstration, verify that `/health` returns `200`, the live response contains successful section metadata, `meta.partial` has the expected value, upstream health becomes `healthy`, and the second request can use the cache. Wake a Serverless Railway deployment with `/health` before presenting it.
+
+### 11. Clear the client variables
+
+When testing is complete:
+
+```bash
+unset TROSS_API_BASE_URL
+unset TROSS_API_KEY
+```
 
 ## Troubleshooting
 
@@ -1306,7 +1238,7 @@ Tradeoff: some transient failures are surfaced after only one retry.
 - Session/drift state resets on restart.
 - No automatic live integration test runs in CI.
 - The system is drift-aware, not self-healing.
-- Deployment requires operator-controlled GitHub/Render access and secrets.
+- Operating another hosted deployment requires infrastructure access and separately managed secrets.
 
 ## Future improvements
 
