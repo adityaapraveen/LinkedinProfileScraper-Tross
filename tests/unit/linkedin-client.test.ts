@@ -40,6 +40,18 @@ describe('LinkedInClient', () => {
     expect(client.sessionHealth.snapshot().status).toBe('healthy');
   });
 
+  it('accepts LinkedIn normalized vendor JSON media types', async () => {
+    const transport = vi
+      .fn<LinkedInTransport>()
+      .mockResolvedValue(
+        response(200, 'application/vnd.linkedin.normalized+json+2.1', '{"data":{}}'),
+      );
+
+    await expect(clientWith(transport).execute(request)).resolves.toMatchObject({
+      data: { data: {} },
+    });
+  });
+
   it.each([
     [401, 'application/json', '{}', 'SESSION_UNAVAILABLE'],
     [403, 'application/json', '{}', 'SESSION_UNAVAILABLE'],

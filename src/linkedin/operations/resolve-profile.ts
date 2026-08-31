@@ -1,7 +1,7 @@
-import { DomainError } from '../../domain/errors.js';
 import type { LinkedInClient } from '../client/linkedin-client.js';
 import { requireConfigured, type ProfileContext } from '../endpoints/endpoint-manifest.js';
 import { resolveProfileEndpoint } from '../endpoints/resolve-profile.endpoint.js';
+import { parseProfileContext } from '../parsing/full-profile.parser.js';
 
 export async function resolveProfile(
   client: LinkedInClient,
@@ -22,9 +22,5 @@ export async function resolveProfile(
     ...(resolveProfileEndpoint.headers ? { headers: resolveProfileEndpoint.headers } : {}),
   });
 
-  void response;
-  throw new DomainError(
-    'SECTION_UNAVAILABLE',
-    'The profile-resolution parser requires a sanitized upstream fixture',
-  );
+  return parseProfileContext(response.data, slug, canonicalUrl);
 }

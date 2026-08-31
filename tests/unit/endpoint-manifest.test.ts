@@ -8,18 +8,40 @@ import { identityEndpoint } from '../../src/linkedin/endpoints/identity.endpoint
 import { resolveProfileEndpoint } from '../../src/linkedin/endpoints/resolve-profile.endpoint.js';
 
 describe('endpoint manifests', () => {
-  it('represent unavailable captures without invented paths', () => {
-    expect(resolveProfileEndpoint).toMatchObject({ support: 'unsupported', path: null });
-    expect(identityEndpoint).toMatchObject({ support: 'unsupported', path: null });
+  it('configures the verified full-profile endpoint for profile resolution and sections', () => {
+    expect(resolveProfileEndpoint).toMatchObject({
+      support: 'configured',
+      id: 'full-profile.v1',
+      path: '/voyager/api/identity/dash/profiles',
+      parserVersion: 'full-profile.v1',
+    });
+    if (resolveProfileEndpoint.support === 'configured') {
+      expect(
+        resolveProfileEndpoint.buildQuery({
+          slug: 'synthetic-person',
+          canonicalUrl: 'https://www.linkedin.com/in/synthetic-person/',
+          profileUrn: null,
+          memberUrn: null,
+        }),
+      ).toEqual(
+        new URLSearchParams({
+          q: 'memberIdentity',
+          memberIdentity: 'synthetic-person',
+          decorationId:
+            'com.linkedin.voyager.dash.deco.identity.profile.FullProfileWithEntities-101',
+        }),
+      );
+    }
+    expect(identityEndpoint).toBe(resolveProfileEndpoint);
   });
 
-  it('fails safely before issuing a request', () => {
-    expect(() => requireConfigured(identityEndpoint)).toThrow(DomainError);
-    expect(() => requireConfigured(identityEndpoint)).toThrow(/identity.v1 is not configured/);
+  it('accepts the verified manifest', () => {
+    expect(() => requireConfigured(identityEndpoint)).not.toThrow();
   });
 
   it('creates explicit unsupported boundaries', () => {
-    expect(unsupportedManifest('test.v1', 'capture required')).toEqual({
+    const manifest = unsupportedManifest('test.v1', 'capture required');
+    expect(manifest).toEqual({
       support: 'unsupported',
       id: 'test.v1',
       version: 1,
@@ -27,5 +49,6 @@ describe('endpoint manifests', () => {
       parserVersion: null,
       reason: 'capture required',
     });
+    expect(() => requireConfigured(manifest)).toThrow(DomainError);
   });
 });

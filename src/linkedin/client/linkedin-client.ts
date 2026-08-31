@@ -170,7 +170,7 @@ export class LinkedInClient {
       throw new DomainError('UPSTREAM_UNAVAILABLE', 'The upstream is temporarily unavailable');
     if (statusCode < 200 || statusCode >= 300)
       throw new DomainError('UPSTREAM_REJECTED', 'The upstream rejected the request');
-    if (!contentType.includes('application/json')) {
+    if (!contentType.includes('application/json') && !contentType.includes('+json')) {
       throw new DomainError('UPSTREAM_REJECTED', 'The upstream returned a non-JSON response');
     }
   }

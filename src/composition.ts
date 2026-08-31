@@ -9,6 +9,7 @@ import { LinkedInClient } from './linkedin/client/linkedin-client.js';
 import { SessionHealth } from './linkedin/client/session-health.js';
 import { DriftMonitor } from './linkedin/diagnostics/drift-monitor.js';
 import { resolveProfile } from './linkedin/operations/resolve-profile.js';
+import { parseProfileSection } from './linkedin/parsing/full-profile.parser.js';
 
 export function createDependencies(config: AppConfig): AppDependencies {
   const sessionHealth = new SessionHealth(hasLinkedInSession(config), (transition) => {
@@ -40,7 +41,24 @@ export function createDependencies(config: AppConfig): AppDependencies {
         return resolveProfile(client, slug, canonicalUrl);
       },
     },
-    operations: {},
+    operations: Object.fromEntries(
+      profileSections.map((section) => [
+        section,
+        (context) =>
+          Promise.resolve()
+            .then(() => parseProfileSection(section, context))
+            .then((result) => {
+              driftMonitor.record(section, 'healthy');
+              return result;
+            })
+            .catch((error: unknown) => {
+              if (error instanceof DomainError && error.code === 'UPSTREAM_SCHEMA_CHANGED') {
+                driftMonitor.record(section, 'breaking_drift');
+              }
+              throw error;
+            }),
+      ]),
+    ),
     cacheTtlSeconds: config.SECTION_CACHE_TTL_SECONDS,
     concurrency: config.UPSTREAM_CONCURRENCY,
     deadlineMs: config.REQUEST_DEADLINE_MS,

@@ -5,6 +5,7 @@ export interface ProfileContext {
   canonicalUrl: string;
   profileUrn: string | null;
   memberUrn: string | null;
+  rawProfile?: unknown;
 }
 
 export interface ConfiguredEndpointManifest {

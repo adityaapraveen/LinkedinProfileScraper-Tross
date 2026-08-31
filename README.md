@@ -1,161 +1,686 @@
 # Tross LinkedIn Profile Extraction API
 
-A drift-aware Node.js/TypeScript API that accepts a LinkedIn `/in/{slug}` URL and returns a stable canonical profile model. The protocol layer is designed for **verified, manually captured LinkedIn internal HTTP requests only**.
+A production-oriented Node.js/TypeScript API that accepts a LinkedIn profile URL and returns the profile's visible data as stable, structured JSON. At runtime it communicates directly with a verified LinkedIn REST.li endpoint. It does not run a browser, render a page, or scrape HTML.
 
-> **Current protocol status:** the safe service foundation is complete, but no real sanitized profile-resolution or identity request/response has been supplied. Endpoint manifests and parsers are therefore explicitly unsupported rather than fabricated. Until verified captures are configured, extraction returns a safe session/section availability error. See [Required capture](#required-capture-to-complete-the-protocol-integration).
+The service extracts these fields when the authenticated LinkedIn session can see them:
+
+- Name, first name, and last name
+- Headline, location, and about/summary
+- Profile image and background image
+- Experience and education
+- Skills, certifications, and languages
+
+The protocol integration has been live-tested against LinkedIn's `FullProfileWithEntities-101` response. A single upstream request supplies the normalized entity graph used by every public profile section.
+
+> LinkedIn's internal APIs are undocumented and can change without notice. This project detects failures and schema incompatibility, but it cannot guarantee that an internal endpoint or session will continue working indefinitely.
+
+## Table of contents
+
+- [What this project does](#what-this-project-does)
+- [What this project does not do](#what-this-project-does-not-do)
+- [Architecture](#architecture)
+- [How the architecture works](#how-the-architecture-works)
+- [End-to-end request lifecycle](#end-to-end-request-lifecycle)
+- [How LinkedIn data is represented](#how-linkedin-data-is-represented)
+- [Project structure](#project-structure)
+- [Requirements](#requirements)
+- [Getting the LinkedIn session values](#getting-the-linkedin-session-values)
+- [Local setup](#local-setup)
+- [Using the API](#using-the-api)
+- [Understanding the response](#understanding-the-response)
+- [Caching and freshness](#caching-and-freshness)
+- [Authentication and session lifecycle](#authentication-and-session-lifecycle)
+- [Failure handling and retries](#failure-handling-and-retries)
+- [Observability and drift detection](#observability-and-drift-detection)
+- [Testing](#testing)
+- [Docker usage](#docker-usage)
+- [Deployment on Render](#deployment-on-render)
+- [Troubleshooting](#troubleshooting)
+- [Security and privacy](#security-and-privacy)
+- [Architecture tradeoffs](#architecture-tradeoffs)
+- [Known limitations](#known-limitations)
+
+## What this project does
+
+The public API receives a URL such as:
+
+```text
+https://www.linkedin.com/in/synthetic-person/
+```
+
+It validates and canonicalizes the URL, extracts only the profile slug, and sends a server-controlled request to this LinkedIn API resource:
+
+```text
+GET /voyager/api/identity/dash/profiles
+  ?q=memberIdentity
+  &memberIdentity={profile-slug}
+  &decorationId=com.linkedin.voyager.dash.deco.identity.profile.FullProfileWithEntities-101
+```
+
+LinkedIn returns normalized JSON containing a graph of entities and URN references. The service dereferences that graph and converts LinkedIn-specific structures into a stable public response model.
+
+For example, LinkedIn may represent experience as:
+
+```text
+Profile
+  -> collection-response URN
+  -> PositionGroup URN
+  -> another collection-response URN
+  -> Position URN
+  -> Company / EmploymentType / Geo URNs
+```
+
+API consumers never need to understand those references. They receive a regular array of experience objects containing fields such as title, company, employment type, location, description, dates, and `isCurrent`.
+
+### Core capabilities
+
+| Capability              | Behavior                                                                                                          |
+| ----------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| Browserless runtime     | Uses `undici` to make direct HTTPS requests.                                                                      |
+| Stable public model     | LinkedIn `$type`, URNs, recipe types, tracking fields, and collection envelopes do not escape the protocol layer. |
+| Selective extraction    | Clients may request all sections or only specific sections.                                                       |
+| One live request        | Any live cache miss causes one full-profile request, not one LinkedIn request per section.                        |
+| Partial-result support  | Independent section failures can be represented without discarding successful sections.                           |
+| Section cache           | Successful canonical sections are cached separately. Raw LinkedIn bodies are not cached.                          |
+| Session circuit breaker | Authentication or checkpoint responses mark the session unavailable and prevent repeated failing requests.        |
+| Drift awareness         | Parser success and schema failures are reported through safe health metadata.                                     |
+| Public API protection   | API-key authentication, URL validation, request-size limits, and per-process rate limiting are included.          |
+| Secret-safe logging     | Cookies, API keys, authorization headers, profile bodies, and CSRF values are redacted or excluded.               |
+
+## What this project does not do
+
+The runtime does not use:
+
+- Playwright, Puppeteer, Selenium, or another browser automation framework
+- DOM parsing or HTML scraping
+- Automatic LinkedIn username/password login
+- CAPTCHA or checkpoint bypassing
+- Proxy rotation or automated account creation
+- User-controlled outbound URLs
+- A database, queue, workflow engine, or microservice fleet
+
+A browser may be used manually by the account owner to inspect their own authenticated network requests and obtain current session values. That investigation process is separate from the deployed application. The deployed service itself remains browserless.
 
 ## Architecture
 
 ```mermaid
 flowchart TD
-  API[HTTP API<br/>auth, URL validation, rate limit] --> UC[ExtractProfileUseCase]
-  UC --> PLAN[ExtractionPlanner + bounded SectionRunner]
-  PLAN --> ADAPTER[LinkedInProtocolAdapter]
-  ADAPTER --> LI[Verified direct LinkedIn endpoints]
-  LI --> PARSERS[Raw response parsers + EntityGraph]
-  PARSERS --> MODEL[Canonical profile model]
-  MODEL --> CACHE[Section cache + public response]
-  ADAPTER --> DIAG[Session health + drift diagnostics]
+  CLIENT[API Client] --> API[HTTP API<br/>rate limit, API key, JSON parsing, URL validation]
+  API --> UC[ExtractProfileUseCase<br/>request orchestration]
+  UC --> PLAN[ExtractionPlanner<br/>cache hits vs live sections]
+  PLAN --> RUNNER[Bounded SectionRunner<br/>deadline and partial failures]
+  UC --> CACHE[(Section Cache)]
+  RUNNER --> ADAPTER[LinkedIn Protocol Adapter<br/>manifest + client + resolver]
+  ADAPTER --> LI[Verified LinkedIn REST.li Endpoint]
+  LI --> GRAPH[EntityGraph<br/>index normalized entities by URN and type]
+  GRAPH --> PARSERS[Canonical Section Parsers]
+  PARSERS --> MODEL[Canonical Profile Model]
+  MODEL --> CACHE
+  MODEL --> API
+  ADAPTER --> HEALTH[Session Health + Drift Monitor]
+  HEALTH --> STATUS[Protected Upstream Health API]
 ```
 
-This is a modular monolith. The HTTP layer does not know LinkedIn routes, query identifiers, cookies, captured headers, or raw response structures. The LinkedIn adapter owns those unstable details. An anti-corruption layer converts them into a stable domain model so `$type`, URNs, tracking fields, query IDs, and component names never escape into the public API.
+This is a modular monolith. All responsibilities live in one deployable Node.js process, but the code is separated into layers with explicit boundaries.
 
-## Direct-endpoint reverse-engineering approach
+That choice is intentional: this challenge needs one reliable HTTP service, not distributed infrastructure. The boundaries make the unstable LinkedIn protocol replaceable without introducing the operational cost of microservices.
 
-The application uses `undici` for direct HTTPS requests. **No browser is used at runtime.** It does not use Playwright, Puppeteer, Selenium, DOM scraping, HTML parsing, proxy rotation, CAPTCHA solving, automated account creation, or access-control bypasses.
+## How the architecture works
 
-A protocol operation is added only after a permitted manual investigation provides:
+### 1. API client
 
-1. A sanitized copied request showing the exact internal route, method, query parameters, and required non-secret headers.
-2. A sanitized JSON response representing the visible profile data.
-3. Variants for missing/empty fields where practical.
-4. A parser, golden canonical output, structural fingerprint metadata, and tests.
+The client can be a command-line script, frontend, backend service, Postman, or any HTTP client. It sends JSON to `POST /v1/profiles/extract` with its public API key in `X-API-Key`.
 
-Internal LinkedIn APIs are undocumented and can change. The adapter is accurately described as **drift-aware**, not self-healing.
+The client never supplies LinkedIn cookies. LinkedIn credentials belong only to the server. This centralizes session material, keeps the public contract stable, and allows the service to rate-limit callers independently of LinkedIn.
 
-## Request flow
+### 2. HTTP API boundary
 
-1. Validate the public API key and public rate limit.
-2. Parse the submitted URL without navigating to it.
-3. Require HTTPS, an explicitly supported hostname, and exactly `/in/{slug}`.
-4. Canonicalize to `https://www.linkedin.com/in/{slug}/`.
-5. Read requested section cache entries when `freshness=prefer-cache`.
-6. Resolve the slug into verified internal profile context when a live operation is needed.
-7. Run independent missing sections with bounded concurrency (default: two).
-8. Normalize successful sections and cache canonical data only.
-9. Return successful sections plus safe per-section status for failures.
+Relevant code lives under `src/api/` and `src/app.ts`.
 
-The user-provided URL is never fetched, followed, or used as an outbound destination. All upstream origins and paths must be internal, configured manifests.
+This stage performs:
 
-## Folder structure
+1. Request logging with sensitive-header redaction.
+2. JSON parsing with a 16 KiB body limit.
+3. Per-client rate limiting.
+4. Constant-time API-key comparison.
+5. Zod request validation.
+6. LinkedIn URL validation and canonicalization.
+7. Conversion of internal errors into fixed public messages.
+
+Only these hosts and paths are accepted:
 
 ```text
-src/
-  api/                 # Controllers, middleware, routes, request schemas
-  application/         # Use case, planner, bounded section runner
-  domain/              # Canonical model and error taxonomy
-  infrastructure/      # In-memory cache and structured logging
-  linkedin/
-    client/             # undici client, retries, classification, circuit breaker
-    endpoints/          # Versioned manifests (currently unsupported without captures)
-    operations/         # Protocol orchestration
-    parsing/            # Entity graph and future verified parsers
-    diagnostics/        # Fingerprints, drift reports, fixture replay
-fixtures/sanitized/     # Sanitized protocol fixtures only
-tests/                  # Unit and mocked integration tests
-tools/                  # Fixture replay CLI
+https://linkedin.com/in/{slug}
+https://www.linkedin.com/in/{slug}
 ```
+
+The parser rejects ports, credentials, query strings, fragments, encoded paths, backslashes, extra path segments, and non-HTTPS URLs.
+
+The submitted URL is never fetched. Only its validated slug is used as a query value in a fixed, server-controlled endpoint manifest. This prevents the profile URL field from becoming an SSRF primitive.
+
+### 3. `ExtractProfileUseCase`
+
+This is the application-level orchestrator in `src/application/extract-profile.use-case.ts`. It does not understand LinkedIn JSON. It coordinates the workflow:
+
+- Create an empty canonical profile.
+- Read requested sections from cache when allowed.
+- Determine which sections still require live data.
+- Resolve the profile through the LinkedIn adapter once.
+- Run the missing section operations.
+- Apply successful results to the canonical profile.
+- Store successful canonical sections in cache.
+- Build response metadata.
+
+Keeping orchestration separate from HTTP and parsing makes it testable with fake resolvers, operations, and caches.
+
+### 4. `ExtractionPlanner`
+
+The planner compares requested sections with cache hits.
+
+```text
+Requested: identity, experience, education, skills
+Cached:    identity, education
+Live plan: experience, skills
+```
+
+If every requested section is cached, no LinkedIn request is made. If at least one section is missing, the full profile is fetched once and only the missing sections are applied.
+
+### 5. `SectionRunner`
+
+The runner provides a uniform boundary for section work. It enforces:
+
+- Bounded concurrency
+- A total extraction deadline
+- Per-section duration measurement
+- Settled-promise handling
+- Independent failure metadata
+
+The current full-profile protocol requires only one upstream request, so section work is primarily parsing. The runner remains useful because it prevents a future expensive section operation from blocking or crashing the entire extraction flow.
+
+A schema exception is converted into a rejected promise before entering the runner. Synchronous parser exceptions therefore become controlled section failures instead of escaping orchestration.
+
+### 6. LinkedIn protocol adapter
+
+The LinkedIn-specific implementation lives under `src/linkedin/` and owns three responsibilities:
+
+- Endpoint manifest: fixed path, headers, decoration ID, and query construction.
+- HTTP client: cookies, CSRF, timeouts, response classification, retries, and session health.
+- Resolver/parser: normalized envelope to internal context and canonical sections.
+
+The public HTTP layer never knows the LinkedIn endpoint or response schema. This anti-corruption layer isolates upstream instability behind a stable interface.
+
+### 7. Verified LinkedIn endpoint
+
+The endpoint manifest defines:
+
+- Origin: fixed as `https://www.linkedin.com`
+- Path: `/voyager/api/identity/dash/profiles`
+- Method: `GET`
+- Query mode: `memberIdentity`
+- Member identity: validated profile slug
+- Decoration: `FullProfileWithEntities-101`
+- REST.li protocol header: `2.0.0`
+- Accept header: LinkedIn normalized vendor JSON
+
+The client accepts standard `application/json` and structured vendor types containing `+json`, including LinkedIn's normalized media type.
+
+### 8. `EntityGraph`
+
+LinkedIn returns an `included[]` array containing different entity types. Those entities reference one another through fields such as `entityUrn`, `*profilePositionGroups`, `*profilePositionInPositionGroup`, `*employmentType`, and `*geo`.
+
+`EntityGraph` indexes included entities:
+
+- By stable URN for reference lookup
+- By `$type` for type-based fallback lookup
+
+This avoids fragile parsing based on array positions. An entity appearing at `included[12]` today may appear at `included[3]` tomorrow; its URN and type are the meaningful identifiers.
+
+### 9. Canonical section parsers
+
+| Section          | Upstream entities/fields used                                                |
+| ---------------- | ---------------------------------------------------------------------------- |
+| `identity`       | Profile, Geo, profile picture vector artifacts, background picture artifacts |
+| `experience`     | PositionGroup, Position, EmploymentType, dates, location, description        |
+| `education`      | Education and date-range entities                                            |
+| `skills`         | Skill entities                                                               |
+| `certifications` | Name, authority, time period, credential ID and URL                          |
+| `languages`      | Language name and proficiency                                                |
+
+For images, the parser selects the largest available vector artifact and combines its root URL with its identifying path segment. Image fields remain `null` when LinkedIn does not provide a usable artifact.
+
+### 10. Canonical profile model
+
+The canonical model under `src/domain/` is the application's stable contract. It contains no LinkedIn implementation details.
+
+This provides two production benefits:
+
+1. API consumers do not break merely because LinkedIn renames an internal type or changes reference layout.
+2. A future protocol implementation can replace the current endpoint without redesigning the public response.
+
+### 11. Section cache
+
+The default cache is an in-memory `Map` behind a small cache interface. Keys have this form:
+
+```text
+profile:{slug}:{section}
+```
+
+Only successfully normalized canonical sections are cached. Raw LinkedIn responses, authentication failures, and parser failures are not cached as profile data.
+
+The default TTL is six hours. Because the cache is process-local, it is cleared on restart and is not shared across instances.
+
+### 12. Session health and drift monitor
+
+Session states:
+
+- `unknown`: credentials are configured but no successful live validation has occurred.
+- `healthy`: the last validation succeeded.
+- `unavailable`: credentials are missing or LinkedIn rejected the session.
+- `challenge`: LinkedIn returned a login/checkpoint/challenge response.
+
+Operation states:
+
+- `unknown`: not parsed during this process lifetime.
+- `healthy`: parsed successfully.
+- `compatible_drift`: optional structural change did not break canonical parsing.
+- `breaking_drift`: required parser structure changed.
+- `session_failure`: reserved by the health contract for session-related observations.
+
+These states are exposed through a protected endpoint without returning cookies, profile content, raw bodies, internal URLs, query IDs, or captured headers.
+
+## End-to-end request lifecycle
+
+For `freshness: "live"`, the lifecycle is:
+
+1. Express receives the request.
+2. Pino assigns request context and redacts configured secrets.
+3. The rate limiter increments the caller's in-process window.
+4. The API-key middleware validates `X-API-Key` using `timingSafeEqual` when lengths match.
+5. Zod validates the body and rejects unknown fields.
+6. The URL parser validates HTTPS, hostname, path, and slug.
+7. The use case creates an empty canonical profile.
+8. Cache reads are skipped because freshness is `live`.
+9. The resolver builds a request from the fixed endpoint manifest.
+10. `LinkedInClient` checks the session circuit breaker.
+11. `undici` sends the cookie, CSRF token, user agent, accept header, and REST.li headers.
+12. The client classifies status, content type, login/checkpoint HTML, and JSON validity.
+13. A successful response marks the session healthy.
+14. The resolver locates the Profile entity and creates request-scoped context containing the normalized envelope.
+15. The runner invokes parsers only for requested, uncached sections.
+16. `EntityGraph` resolves URN relationships.
+17. Parsers produce canonical data and report healthy operation status.
+18. Successful sections are cached independently.
+19. The use case builds `profile` and `meta`.
+20. The controller logs safe outcomes and returns JSON.
+
+## How LinkedIn data is represented
+
+LinkedIn's normalized API separates references from entities:
+
+```json
+{
+  "data": { "*elements": ["urn:li:fsd_profile:SYNTHETIC"] },
+  "included": [
+    {
+      "entityUrn": "urn:li:fsd_profile:SYNTHETIC",
+      "*profileSkills": "urn:li:collectionResponse:SYNTHETIC_SKILLS",
+      "$type": "com.linkedin.voyager.dash.identity.profile.Profile"
+    },
+    {
+      "entityUrn": "urn:li:collectionResponse:SYNTHETIC_SKILLS",
+      "*elements": ["urn:li:fsd_skill:SYNTHETIC_1"],
+      "$type": "com.linkedin.restli.common.CollectionResponse"
+    },
+    {
+      "entityUrn": "urn:li:fsd_skill:SYNTHETIC_1",
+      "name": "TypeScript",
+      "$type": "com.linkedin.voyager.dash.identity.profile.Skill"
+    }
+  ]
+}
+```
+
+The public API converts that graph into:
+
+```json
+{ "skills": [{ "name": "TypeScript" }] }
+```
+
+This graph-first design is more maintainable than searching arbitrary nested objects or relying on array order.
+
+## Project structure
+
+```text
+.
+├── src/
+│   ├── api/
+│   │   ├── controllers/       # Translate HTTP requests/responses
+│   │   ├── middleware/        # API key, rate limit, and error handling
+│   │   ├── routes/            # Express route composition
+│   │   └── schemas/           # Zod validation and URL parsing
+│   ├── application/
+│   │   ├── extract-profile.use-case.ts
+│   │   ├── extraction-planner.ts
+│   │   └── section-runner.ts
+│   ├── domain/
+│   │   ├── errors.ts          # Safe error taxonomy
+│   │   ├── extraction.ts      # Response metadata model
+│   │   └── profile.ts         # Canonical profile model
+│   ├── infrastructure/
+│   │   ├── cache/             # Cache interface and memory implementation
+│   │   └── logging/           # Pino and redaction
+│   ├── linkedin/
+│   │   ├── client/            # Direct HTTP transport and session breaker
+│   │   ├── diagnostics/       # Drift, fingerprints, fixture tooling
+│   │   ├── endpoints/         # Verified endpoint manifest
+│   │   ├── operations/        # Full-profile resolution
+│   │   └── parsing/           # Entity graph and canonical parsers
+│   ├── app.ts                 # Express composition
+│   ├── composition.ts         # Production dependency wiring
+│   ├── config.ts              # Environment validation
+│   └── server.ts              # Startup and graceful shutdown
+├── tests/
+│   ├── integration/           # HTTP behavior using local test servers
+│   └── unit/                  # Protocol, parser, cache, and security tests
+├── fixtures/
+│   ├── raw/                   # Git-ignored private captures
+│   └── sanitized/             # Privacy-reviewed replay fixtures only
+├── tools/                     # Fixture sanitizer and replay commands
+├── openapi.yaml               # OpenAPI 3.1 contract
+├── Dockerfile                 # Multi-stage production image
+├── docker-compose.yml         # Local container orchestration
+├── render.yaml                # Render service blueprint
+└── .github/workflows/ci.yml   # Offline CI verification
+```
+
+## Requirements
+
+- Node.js 20 or newer
+- npm
+- A LinkedIn session belonging to an account you are authorized to use
+- Permission to access and process the target profile data
+
+```bash
+node --version
+npm --version
+```
+
+## Getting the LinkedIn session values
+
+The service does not accept a LinkedIn email or password. It uses an existing authenticated session.
+
+Use your own logged-in LinkedIn account and inspect a normal request in browser Developer Tools:
+
+1. Sign in to LinkedIn normally.
+2. Open Developer Tools and select Network.
+3. Load a profile your account can view.
+4. Select an authenticated request to `/voyager/api/`.
+5. Copy the complete `Cookie` request-header value.
+6. Copy the `csrf-token` request header.
+7. Copy the exact `User-Agent` request header.
+8. Store those values only in local or deployment secrets.
+
+The cookie normally includes `li_at` and `JSESSIONID`. The CSRF token normally equals `JSESSIONID` without surrounding quotes:
+
+```text
+Cookie fragment: JSESSIONID="ajax:123456789..."
+csrf-token:      ajax:123456789...
+```
+
+Never paste these values into an issue, commit, README, build argument, image layer, or public deployment log.
 
 ## Local setup
 
-Requirements: Node.js 20 or newer and npm.
+### 1. Install dependencies
 
 ```bash
 npm install
+```
+
+### 2. Create local configuration
+
+```bash
 cp .env.example .env
-# Set a strong PUBLIC_API_KEY. Add LinkedIn session values only through local/deployment secrets.
+```
+
+Edit `.env`:
+
+```env
+NODE_ENV=development
+PORT=3000
+PUBLIC_API_KEY=replace-with-a-long-random-public-api-key
+
+LINKEDIN_COOKIE='li_at=REDACTED; JSESSIONID="ajax:REDACTED"; other_cookie=REDACTED'
+LINKEDIN_CSRF_TOKEN=ajax:REDACTED
+LINKEDIN_USER_AGENT=Mozilla/5.0 ...
+
+UPSTREAM_TIMEOUT_MS=8000
+REQUEST_DEADLINE_MS=20000
+UPSTREAM_CONCURRENCY=2
+SECTION_CACHE_TTL_SECONDS=21600
+PUBLIC_RATE_LIMIT_MAX=60
+PUBLIC_RATE_LIMIT_WINDOW_MS=60000
+LOG_LEVEL=info
+```
+
+Use outer single quotes for the complete cookie when it contains quoted `JSESSIONID`. This preserves the inner double quotes when Node loads `.env`.
+
+Generate a strong public API key:
+
+```bash
+openssl rand -hex 32
+```
+
+`PUBLIC_API_KEY` protects your API. It is different from the LinkedIn session and must be at least 16 characters.
+
+### 3. Start development mode
+
+```bash
 npm run dev
 ```
 
-The app validates configuration with Zod at startup. `GET /health` is public; `/v1/*` routes require `X-API-Key`.
+Development mode uses `tsx watch`, loads `.env`, and restarts when TypeScript files change.
+
+If port 3000 is occupied, set another port in `.env`:
+
+```env
+PORT=3107
+```
+
+### 4. Verify process health
+
+```bash
+curl 'http://localhost:3000/health'
+```
+
+```json
+{
+  "status": "ok",
+  "timestamp": "2026-08-31T00:00:00.000Z"
+}
+```
+
+This proves only that the process is accepting requests. It does not contact LinkedIn or prove session validity.
+
+### 5. Verify upstream state
+
+```bash
+curl \
+  --header 'X-API-Key: replace-with-your-public-api-key' \
+  'http://localhost:3000/v1/upstream/health'
+```
+
+Before the first live request, a configured session is normally `unknown`. After a successful extraction, it becomes `healthy`.
+
+### Production-style local startup
+
+```bash
+npm run build
+node --env-file=.env dist/server.js
+```
+
+`npm start` expects a production environment such as Render or Docker to inject variables. The explicit Node command above loads `.env` for a local production build.
 
 ## Environment variables
 
-| Variable                      | Required          | Default       | Purpose                                          |
-| ----------------------------- | ----------------- | ------------- | ------------------------------------------------ |
-| `PUBLIC_API_KEY`              | Yes               | —             | Public API authentication; minimum 16 characters |
-| `PORT`                        | No                | `3000`        | HTTP listener port                               |
-| `NODE_ENV`                    | No                | `development` | Runtime mode                                     |
-| `LINKEDIN_COOKIE`             | For live protocol | —             | Externally supplied session cookie               |
-| `LINKEDIN_CSRF_TOKEN`         | For live protocol | —             | Matching CSRF value                              |
-| `LINKEDIN_USER_AGENT`         | For live protocol | —             | User agent from the permitted capture            |
-| `UPSTREAM_TIMEOUT_MS`         | No                | `8000`        | Per-upstream-request timeout                     |
-| `REQUEST_DEADLINE_MS`         | No                | `20000`       | Extraction deadline                              |
-| `UPSTREAM_CONCURRENCY`        | No                | `2`           | Bounded section concurrency; maximum 3           |
-| `SECTION_CACHE_TTL_SECONDS`   | No                | `21600`       | Successful section TTL (six hours)               |
-| `PUBLIC_RATE_LIMIT_MAX`       | No                | `60`          | Requests per client window                       |
-| `PUBLIC_RATE_LIMIT_WINDOW_MS` | No                | `60000`       | Public rate-limit window                         |
-| `LOG_LEVEL`                   | No                | `info`        | Pino log level                                   |
+| Variable                      | Required            | Default       | Purpose                                          |
+| ----------------------------- | ------------------- | ------------- | ------------------------------------------------ |
+| `PUBLIC_API_KEY`              | Yes                 | —             | Public API authentication; minimum 16 characters |
+| `PORT`                        | No                  | `3000`        | HTTP listener port                               |
+| `NODE_ENV`                    | No                  | `development` | `development`, `test`, or `production`           |
+| `LINKEDIN_COOKIE`             | For live extraction | —             | Complete LinkedIn `Cookie` header value          |
+| `LINKEDIN_CSRF_TOKEN`         | For live extraction | —             | CSRF value matching `JSESSIONID` without quotes  |
+| `LINKEDIN_USER_AGENT`         | For live extraction | —             | User agent associated with the captured session  |
+| `UPSTREAM_TIMEOUT_MS`         | No                  | `8000`        | One LinkedIn request timeout; 1–30 seconds       |
+| `REQUEST_DEADLINE_MS`         | No                  | `20000`       | Total extraction deadline; 2–60 seconds          |
+| `UPSTREAM_CONCURRENCY`        | No                  | `2`           | Section concurrency; 1–3                         |
+| `SECTION_CACHE_TTL_SECONDS`   | No                  | `21600`       | Successful section TTL; minimum 60 seconds       |
+| `PUBLIC_RATE_LIMIT_MAX`       | No                  | `60`          | Requests permitted per client window             |
+| `PUBLIC_RATE_LIMIT_WINDOW_MS` | No                  | `60000`       | Public rate-limit window                         |
+| `LOG_LEVEL`                   | No                  | `info`        | Pino log level                                   |
 
-All three LinkedIn session variables must be supplied together or omitted together. Never commit `.env` or deployment secrets.
+All three LinkedIn session variables must be configured together or omitted together. Partial configuration fails startup validation.
 
-## API documentation
+## Using the API
 
 The complete OpenAPI 3.1 contract is in [`openapi.yaml`](./openapi.yaml).
 
-### Health
+### Public health endpoint
 
 ```http
 GET /health
 ```
 
-```json
-{ "status": "ok", "timestamp": "2026-08-28T00:00:00.000Z" }
+No API key is required.
+
+### Extract a profile
+
+```http
+POST /v1/profiles/extract
+X-API-Key: your-public-api-key
+Content-Type: application/json
 ```
 
-### Extract profile
+| Body field  | Required | Meaning                                              |
+| ----------- | -------- | ---------------------------------------------------- |
+| `url`       | Yes      | LinkedIn `/in/{slug}` profile URL                    |
+| `sections`  | No       | Unique subset of supported sections; defaults to all |
+| `freshness` | No       | `prefer-cache` or `live`; defaults to `prefer-cache` |
+
+Supported sections:
+
+```text
+identity
+experience
+education
+skills
+certifications
+languages
+```
+
+#### Extract every section
 
 ```bash
 curl --request POST 'http://localhost:3000/v1/profiles/extract' \
   --header 'X-API-Key: replace-with-your-public-api-key' \
   --header 'Content-Type: application/json' \
   --data '{
-    "url": "https://www.linkedin.com/in/synthetic-profile/",
-    "sections": ["identity", "experience", "education", "skills", "certifications", "languages"],
+    "url": "https://www.linkedin.com/in/synthetic-person/",
     "freshness": "prefer-cache"
   }'
 ```
 
-Sections are optional and default to all supported sections. `freshness` is `prefer-cache` or `live`.
+#### Extract only identity and experience
 
-Sanitized shape example (illustrative canonical data, not a claim that the currently unsupported protocol operation succeeds):
+```bash
+curl --request POST 'http://localhost:3000/v1/profiles/extract' \
+  --header 'X-API-Key: replace-with-your-public-api-key' \
+  --header 'Content-Type: application/json' \
+  --data '{
+    "url": "https://www.linkedin.com/in/synthetic-person/",
+    "sections": ["identity", "experience"],
+    "freshness": "prefer-cache"
+  }'
+```
+
+#### Force a live refresh
+
+```bash
+curl --request POST 'http://localhost:3000/v1/profiles/extract' \
+  --header 'X-API-Key: replace-with-your-public-api-key' \
+  --header 'Content-Type: application/json' \
+  --data '{
+    "url": "https://www.linkedin.com/in/synthetic-person/",
+    "freshness": "live"
+  }'
+```
+
+`live` skips cache reads but refreshes successful cache entries.
+
+### Full synthetic response example
 
 ```json
 {
   "profile": {
-    "profileUrl": "https://www.linkedin.com/in/synthetic-profile/",
+    "profileUrl": "https://www.linkedin.com/in/synthetic-person/",
     "identity": {
       "name": "Synthetic Person",
       "firstName": "Synthetic",
       "lastName": "Person",
-      "headline": null,
-      "location": null,
-      "about": null,
-      "images": { "profile": null, "background": null }
+      "headline": "Platform Engineer",
+      "location": "Synthetic City",
+      "about": "Builds dependable systems.",
+      "images": {
+        "profile": "https://media.example/profile_large.jpg",
+        "background": "https://media.example/background_wide.jpg"
+      }
     },
-    "experience": [],
-    "education": [],
-    "skills": [],
-    "certifications": [],
-    "languages": []
+    "experience": [
+      {
+        "title": "Senior Engineer",
+        "company": "Synthetic Labs",
+        "employmentType": "Full-time",
+        "location": "Remote",
+        "description": "Owned the API platform.",
+        "startDate": { "year": 2023, "month": 2 },
+        "endDate": null,
+        "isCurrent": true
+      }
+    ],
+    "education": [
+      {
+        "school": "Synthetic University",
+        "degree": "BSc",
+        "fieldOfStudy": "Computer Science",
+        "startYear": 2018,
+        "endYear": 2022,
+        "description": "Systems programme"
+      }
+    ],
+    "skills": [{ "name": "TypeScript" }],
+    "certifications": [
+      {
+        "name": "Cloud Engineer",
+        "authority": "Synthetic Cloud",
+        "issuedAt": "2024-03",
+        "expiresAt": "2027-03",
+        "credentialId": "CERT-1",
+        "credentialUrl": "https://credentials.example/CERT-1"
+      }
+    ],
+    "languages": [{ "name": "English", "proficiency": "NATIVE_OR_BILINGUAL" }]
   },
   "meta": {
-    "partial": true,
-    "retrievedAt": "2026-08-28T00:00:00.000Z",
+    "partial": false,
+    "retrievedAt": "2026-08-31T00:00:00.000Z",
     "cached": false,
     "sections": {
-      "identity": { "status": "success", "source": "identity.v1", "durationMs": 120 },
-      "skills": { "status": "failed", "error": "UPSTREAM_SCHEMA_CHANGED", "durationMs": 94 }
+      "identity": { "status": "success", "source": "full-profile.v1", "durationMs": 2 },
+      "experience": { "status": "success", "source": "full-profile.v1", "durationMs": 1 },
+      "education": { "status": "success", "source": "full-profile.v1", "durationMs": 0 },
+      "skills": { "status": "success", "source": "full-profile.v1", "durationMs": 0 },
+      "certifications": { "status": "success", "source": "full-profile.v1", "durationMs": 1 },
+      "languages": { "status": "success", "source": "full-profile.v1", "durationMs": 0 }
     }
   }
 }
@@ -163,84 +688,150 @@ Sanitized shape example (illustrative canonical data, not a claim that the curre
 
 ### Protected upstream health
 
-```bash
-curl --header 'X-API-Key: replace-with-your-public-api-key' \
-  'http://localhost:3000/v1/upstream/health'
+```http
+GET /v1/upstream/health
+X-API-Key: your-public-api-key
 ```
 
-This endpoint exposes only session status, timestamps, operation compatibility status, and a drift boolean. It never exposes cookies, CSRF values, internal URLs, captured headers, raw responses, query identifiers, or profile data.
+```json
+{
+  "session": {
+    "status": "healthy",
+    "lastValidatedAt": "2026-08-31T00:00:00.000Z"
+  },
+  "operations": {
+    "identity": {
+      "status": "healthy",
+      "lastSuccessAt": "2026-08-31T00:00:00.010Z",
+      "schemaDrift": false
+    }
+  }
+}
+```
+
+This endpoint returns operational state only. It never returns session values, profile content, raw bodies, internal URLs, query IDs, or captured headers.
+
+## Understanding the response
+
+### `profile`
+
+`profile` is the canonical data object. It always contains every top-level section. Unrequested or unavailable collection sections retain empty defaults.
+
+### `null` versus `[]`
+
+- `null` means a scalar/object was unavailable, invisible, or lacked a usable upstream representation.
+- `[]` means a collection has no visible parsed entities.
+- An empty array with section status `success` is not an error.
+
+### `meta.partial`
+
+`partial` is `true` when at least one requested section failed. It is not set merely because LinkedIn returned an empty collection or `null` optional field.
+
+### `meta.cached`
+
+`cached` is `true` only when every requested section came from cache. A response mixing cached and fresh sections has `cached: false`.
+
+### Section metadata
+
+- `status`: `success` or `failed`
+- `source`: `full-profile.v1` for live parsing or `cache.v1`
+- `durationMs`: section execution time
+- `error`: safe error code when failed
+
+## Caching and freshness
+
+### `prefer-cache`
+
+1. Read each requested section from cache.
+2. If all are cached, return without LinkedIn.
+3. If any is missing, fetch the full profile once.
+4. Parse only missing requested sections.
+5. Cache successful results.
+
+### `live`
+
+1. Skip cache reads.
+2. Fetch LinkedIn once.
+3. Parse every requested section.
+4. Refresh successful cache entries.
+
+Prefer cache for normal traffic to reduce latency, upstream requests, rate-limit exposure, and account risk. Use `live` for explicit refreshes and smoke tests.
+
+### Scaling implication
+
+The memory cache and rate limiter belong to one process. Multiple instances do not share them, and restarts clear them. A multi-instance production deployment should implement the existing cache boundary with Redis and use a distributed rate limiter.
 
 ## Authentication and session lifecycle
 
-LinkedIn session material is supplied externally; automatic username/password login is intentionally absent. Cookies, CSRF values, authorization-related fields, API keys, profile content, and raw bodies are redacted or excluded from logs and public errors.
+There are two separate authentication boundaries.
 
-A `401`, `403`, or detected login/checkpoint HTML response marks the session unhealthy and opens an in-process circuit breaker. New upstream requests fail safely with `SESSION_UNAVAILABLE`. Replace deployment secrets and restart the process to restore health. Session cookies expire and require manual rotation. Visible data depends on the authenticated session and LinkedIn visibility rules.
+### Public API authentication
 
-## Structured logging
+Callers send `X-API-Key`. Missing or incorrect keys return `401 UNAUTHORIZED`.
 
-Pino emits request IDs, operation names, durations, cache hits, section status, safe error codes, session-health transitions, and schema-drift classifications. Profile contents, raw upstream bodies, cookies, CSRF values, authorization headers, and API keys are never intentionally logged. Section logs are emitted from the request-scoped logger so they retain the HTTP request ID.
+### LinkedIn authentication
 
-## Retry policy
+The server sends its complete cookie, matching CSRF token, and captured user agent. It does not log in automatically. When the session expires, a human rotates all session secrets.
 
-At most one retry is made, with exponential delay and jitter, for a timeout/network failure or temporary upstream `502`/`503`. Authentication failures, checkpoints, `429`, profile-not-found responses, parser failures, and schema drift are not retried. A strict operation timeout and extraction deadline bound work.
+### Circuit breaker
 
-## Caching strategy
+A LinkedIn `401`, `403`, or detected login/checkpoint HTML response transitions the session to `unavailable` or `challenge`. Future requests fail immediately instead of repeatedly sending a rejected session.
 
-Successful canonical sections are cached independently under `profile:{slug}:{section}` for six hours by default. Raw LinkedIn responses and authentication failures are never cached as profile results. `live` bypasses reads but successful normalized values can refresh the cache.
+After rotating secrets, restart the process. Session health is in-memory and resets at startup.
 
-The included cache is process-local. A multi-instance production deployment should replace the cache interface with Redis so instances share values and invalidation.
+## Failure handling and retries
 
-## Error taxonomy
+The client retries at most once for network failures, timeouts, and upstream `502`/`503`. It uses a small exponential delay plus jitter.
 
-| Code                                                                |                                                  Typical HTTP status |
-| ------------------------------------------------------------------- | -------------------------------------------------------------------: |
-| `INVALID_PROFILE_URL`                                               |                                                                  400 |
-| `UNSUPPORTED_PROFILE_URL`                                           |                                                                  422 |
-| `PROFILE_NOT_FOUND`                                                 |                                                                  404 |
-| `SESSION_UNAVAILABLE`, `SESSION_CHALLENGE`                          |                                                                  503 |
-| `UPSTREAM_RATE_LIMITED`, `UPSTREAM_TIMEOUT`, `UPSTREAM_UNAVAILABLE` |                                                                  503 |
-| `UPSTREAM_REJECTED`, `UPSTREAM_SCHEMA_CHANGED`                      |                                                                  502 |
-| `SECTION_UNAVAILABLE`                                               | 503 when no extraction can start; otherwise section failure metadata |
-| `INTERNAL_ERROR`                                                    |                                                                  500 |
+It does not retry authentication failures, challenges, `404`, `429`, invalid JSON, schema incompatibility, or parser failures. Conservative retries prevent retry storms and reduce rate-limit/account pressure.
 
-Public API authentication failures return `401`; the public rate limiter returns `429`. Public messages are fixed and never contain raw upstream bodies.
+| Code                      |            HTTP | Meaning                                    |
+| ------------------------- | --------------: | ------------------------------------------ |
+| `INVALID_PROFILE_URL`     |             400 | Invalid syntax or forbidden URL components |
+| `UNSUPPORTED_PROFILE_URL` |             422 | Not a supported LinkedIn profile URL       |
+| `PROFILE_NOT_FOUND`       |             404 | Upstream profile not found                 |
+| `SESSION_UNAVAILABLE`     |             503 | Session missing, rejected, or circuit open |
+| `SESSION_CHALLENGE`       |             503 | LinkedIn requires manual attention         |
+| `UPSTREAM_RATE_LIMITED`   |             503 | LinkedIn returned `429`                    |
+| `UPSTREAM_TIMEOUT`        |             503 | Upstream/deadline timeout                  |
+| `UPSTREAM_UNAVAILABLE`    |             503 | Temporary network or upstream failure      |
+| `UPSTREAM_REJECTED`       |             502 | Status, content type, or JSON rejected     |
+| `UPSTREAM_SCHEMA_CHANGED` |             502 | Required normalized structure changed      |
+| `SECTION_UNAVAILABLE`     | 503 or metadata | Section operation unavailable              |
+| `INTERNAL_ERROR`          |             500 | Unexpected internal failure                |
 
-## Drift detection and fixture replay
+Public messages are fixed. Raw bodies and internal exception messages are not returned. Public authentication returns `401 UNAUTHORIZED`; public rate limiting returns `429 RATE_LIMITED`.
 
-Structural fingerprints collect sorted JSON paths and types, never values, and hash them with SHA-256. New optional paths are `compatible_drift`; a missing or type-changed required parser path is `breaking_drift`. Login/checkpoint responses are classified as session failures before JSON drift checks.
+## Observability and drift detection
 
-```bash
-npm run protocol:replay
-```
+Pino JSON logs contain request IDs, routes, statuses, durations, section names, cache-hit flags, safe error codes, session transitions, and drift states.
 
-The command discovers sanitized fixtures, invokes the registered parser, compares canonical output to `expected.json`, computes a fingerprint, compares metadata, prints a compatibility report, and exits non-zero for an unavailable parser or golden-output failure. At present it reports that no fixtures exist because no verified response has been supplied.
+Redaction covers cookie and authorization headers, `X-API-Key`, CSRF values, API-key fields, profile objects, and response-body fields. Raw LinkedIn bodies are never intentionally logged.
 
-Raw responses must remain under ignored `fixtures/raw/`. The sanitizer fails closed unless every non-boolean scalar is explicitly replaced or preserved by JSON path; it automatically redacts secret-bearing keys and refuses to overwrite its input:
+Drift classifications:
+
+- Healthy: required structure remains available.
+- Compatible drift: optional structure changed without breaking canonical parsing.
+- Breaking drift: required entity/path/type changed.
+
+Structural fingerprints collect paths and types, not values, and hash them with SHA-256.
+
+### Fixture sanitation and replay
+
+Raw captures belong only in ignored `fixtures/raw/`. The sanitizer fails closed: every non-boolean scalar must be explicitly replaced or reviewed for preservation.
 
 ```bash
 npm run protocol:sanitize -- \
   fixtures/raw/upstream.json \
-  fixtures/sanitized/identity/standard/upstream.json \
+  fixtures/sanitized/full-profile/standard/upstream.json \
   fixtures/raw/sanitization-policy.json
+
+npm run protocol:replay
 ```
 
-A policy has the shape below. Replacement values must retain the original JSON type. `$type`, booleans, and `null` are structurally preserved; every explicit `preservePaths` entry must be privacy-reviewed.
-
-```json
-{
-  "replacements": {
-    "$.included[0].firstName": "Synthetic",
-    "$.included[0].entityUrn": "urn:li:fsd_profile:SYNTHETIC_1"
-  },
-  "preservePaths": ["$.data.paging.total"]
-}
-```
-
-The generated file still requires manual privacy review before it is staged.
+No real profile fixture is committed. Complete field behavior is covered by a synthetic graph in `tests/unit/full-profile.parser.test.ts`.
 
 ## Testing
-
-All upstream HTTP calls are mocked. No live integration test runs in CI by default.
 
 ```bash
 npm run format:check
@@ -251,67 +842,188 @@ npm run protocol:replay
 npm run build
 ```
 
-Coverage includes URL normalization and malicious URLs, API keys, public error sanitization, entity indexing, partial extraction, cache hits/misses, bounded concurrency, authentication/checkpoint and HTML classification, rate limits, retries, circuit breaking, schema fingerprints, and fixture replay. GitHub Actions runs the complete offline verification suite and builds the production container without LinkedIn or deployment secrets.
+Coverage includes URL attacks, API keys, public error sanitization, rate limits, LinkedIn response classification, vendor JSON, retries, checkpoints, circuit breaking, URN indexing, all profile sections, images, cache behavior, partial extraction, concurrency, fingerprints, and fixture tooling.
+
+All normal tests mock LinkedIn. CI needs no LinkedIn cookie and makes no live request.
+
+### Manual live smoke test
+
+1. Configure a permitted session locally.
+2. Start the service.
+3. Send one `freshness: "live"` extraction.
+4. Confirm `200` and successful section metadata.
+5. Check upstream health.
+
+Do not put live credentials in public CI.
+
+### GitHub Actions
+
+CI runs `npm ci`, formatting, lint, type checking, offline tests, fixture replay, TypeScript build, and production Docker build.
 
 ## Docker usage
 
+### Docker Compose
+
+```bash
+docker compose up --build
+docker compose down
+```
+
+Compose loads `.env`, exposes the configured port, enables an init process, restarts unless stopped, and performs an HTTP health check.
+
+### Direct Docker
+
 ```bash
 docker build -t tross-linkedin-api .
-docker run --rm -p 3000:3000 \
-  -e PUBLIC_API_KEY='replace-with-a-strong-random-key' \
+
+docker run --rm \
+  --env-file .env \
+  --publish 3000:3000 \
   tross-linkedin-api
 ```
 
-Supply LinkedIn session variables with runtime secrets, never Docker build arguments or image layers. Docker Compose can load a local uncommitted `.env`.
+The Dockerfile uses a build stage for TypeScript and a smaller production stage with production dependencies, `dist/`, a non-root user, and a health check.
 
-## Render deployment
+Never pass credentials as Docker build arguments; build metadata and layers are not secret stores.
 
-1. Create a Render Web Service from this repository and select `feat/linkedin-protocol-adapter` until merged into `main`.
-2. Use the included Dockerfile.
-3. Configure `PUBLIC_API_KEY`, `LINKEDIN_COOKIE`, `LINKEDIN_CSRF_TOKEN`, and `LINKEDIN_USER_AGENT` as Render secrets.
-4. Set health check path to `/health`.
-5. Deploy, then verify `/health`, authenticated `/v1/upstream/health`, and `/v1/profiles/extract`.
-6. Do not expect extraction to succeed until verified manifests and parsers are implemented from sanitized captures.
+## Deployment on Render
 
-Render provides HTTPS at its public service origin. This repository does not contain Render credentials or a service identifier, so deployment cannot be performed from source alone.
+The repository contains `render.yaml` and a production Dockerfile.
 
-## Security considerations
+1. Push the repository to GitHub.
+2. Create a Render Web Service or Blueprint.
+3. Select the completed branch.
+4. Use the included Dockerfile.
+5. Configure `PUBLIC_API_KEY`, `LINKEDIN_COOKIE`, `LINKEDIN_CSRF_TOKEN`, and `LINKEDIN_USER_AGENT` as Render secrets.
+6. Keep `NODE_ENV=production`.
+7. Set `/health` as the health-check path.
+8. Deploy and verify health.
+9. Perform one permitted live extraction.
 
-- The submitted URL is parsed only; it is never requested.
-- Only HTTPS and `linkedin.com`/`www.linkedin.com` with `/in/{slug}` are accepted.
-- Ports, credentials, query strings, fragments, encoded paths, extra path segments, Sales Navigator, company, job, and search URLs are rejected.
-- Outbound origin and manifest paths are controlled internally.
-- Request bodies are limited to 16 KiB.
-- Secrets are loaded from environment variables and redacted from structured logs.
-- Raw copied cURL requests, HAR files, session state, raw responses, and personal fixtures are prohibited from Git.
-- The software does not bypass CAPTCHA or access controls.
-- LinkedIn's terms and applicable privacy/data-protection requirements must be reviewed before production use.
+Render provides HTTPS. Replace the placeholder server URL in `openapi.yaml` with the deployed origin when available.
+
+When the LinkedIn session expires, rotate all three session secrets together, restart/redeploy, and perform one live validation.
+
+## Troubleshooting
+
+### Configuration validation fails
+
+Use a `PUBLIC_API_KEY` of at least 16 characters. Configure all three LinkedIn fields or none of them.
+
+### `CSRF check failed`
+
+Verify that the complete cookie includes `JSESSIONID`, that CSRF matches it without quotes, and that the cookie uses outer single quotes:
+
+```env
+LINKEDIN_COOKIE='...; JSESSIONID="ajax:matching-value"; ...'
+LINKEDIN_CSRF_TOKEN=ajax:matching-value
+```
+
+### `401 UNAUTHORIZED`
+
+`X-API-Key` does not match `PUBLIC_API_KEY`. This is unrelated to LinkedIn authentication.
+
+### `503 SESSION_UNAVAILABLE`
+
+Session variables may be missing/expired/rejected, or a previous failure opened the circuit. Rotate session secrets and restart.
+
+### `503 SESSION_CHALLENGE`
+
+Resolve the account state manually in LinkedIn, rotate the session, and restart. The project does not bypass challenges.
+
+### `502 UPSTREAM_SCHEMA_CHANGED`
+
+LinkedIn no longer provides required parser structure. Privately capture the changed response, compare structural paths, update manifest/parser, and add a sanitized or synthetic regression fixture.
+
+### Successful empty arrays
+
+This means no matching entities were visible. The profile may omit the section or hide it from this account. It is not automatically a parser error.
+
+### Image is `null`
+
+LinkedIn may not provide a usable vector artifact. Image URLs can also be signed and time-limited.
+
+### Port is occupied
+
+Change `PORT` and use the same port in your requests.
+
+### Cache disappears after restart
+
+Expected: the included cache is process-local. Use Redis for shared persistence.
+
+## Security and privacy
+
+Implemented controls include:
+
+- HTTPS-only LinkedIn URLs and strict hostname allowlist
+- Exact `/in/{slug}` validation
+- Rejection of ports, credentials, queries, fragments, encoded paths, and extra segments
+- Fixed upstream origin/path and encoded query values
+- Constant-time public API-key comparison after length checking
+- Public rate limiting and 16 KiB body limit
+- Upstream timeout and request deadline
+- Session circuit breaker
+- Log redaction and fixed public errors
+- Git ignores for secrets, HARs, raw fixtures, logs, and build output
+- Non-root production container
+
+Never commit `.env`, HARs, copied authenticated cURL requests, complete cookies, `li_at`, `JSESSIONID`, CSRF values, raw personal responses, or deployment secrets.
+
+The account's ability to view data does not automatically grant permission to store or redistribute it. Review current LinkedIn terms, privacy law, data minimization, retention, consent/lawful basis, and audit requirements before production use.
+
+## Architecture tradeoffs
+
+### Modular monolith
+
+Benefits: one build/deployment, simple debugging, no internal network calls, and clear boundaries without distributed overhead.
+
+Tradeoff: scaling is process-oriented and local cache/rate-limit state is not shared.
+
+### One decorated full-profile endpoint
+
+Benefits: one upstream request, lower latency/rate-limit pressure, consistent section snapshot, and simple lifecycle.
+
+Tradeoffs: one decoration change can affect multiple sections, and a small-section request may fetch more visible upstream fields than it returns.
+
+### Canonical anti-corruption layer
+
+Benefits: stable public API, easier testing, isolated internals, and replaceable protocol.
+
+Tradeoff: upstream richness is omitted until the canonical contract intentionally supports it.
+
+### Section cache
+
+Benefits: independent reuse, no poisoning by failed sections, and useful partial hits.
+
+Tradeoff: mixed responses can contain sections retrieved at different times.
+
+### Conservative retries
+
+Benefits: prevents storms and reduces account/rate-limit pressure.
+
+Tradeoff: some transient failures are surfaced after only one retry.
 
 ## Known limitations
 
-- Profile resolution and all section manifests/parsers are blocked pending verified sanitized protocol artifacts.
-- LinkedIn internal APIs are undocumented and may change without notice.
-- Session cookies expire and require external rotation.
-- LinkedIn may rate-limit, reject, or challenge direct requests.
-- Data visibility depends on the authenticated session.
-- Partial results may be returned when individual sections fail.
-- Image URLs, once implemented, may be signed and may expire.
-- The in-memory cache and rate limiter are per instance.
-- Circuit health resets on process restart; there is no distributed state.
-- The integration is drift-aware, not self-healing.
+- Internal APIs and decoration versions are undocumented and unstable.
+- Session cookies expire and require manual rotation.
+- LinkedIn may rate-limit, reject, or challenge requests.
+- Visibility depends on the authenticated account and relationship to the profile.
+- Empty/hidden collections become `[]`; unavailable optional fields become `null`.
+- Image URLs may expire.
+- Cache and rate limiting are process-local.
+- Session/drift state resets on restart.
+- No automatic live integration test runs in CI.
+- The system is drift-aware, not self-healing.
+- Deployment requires operator-controlled GitHub/Render access and secrets.
 
-## Tradeoffs and future improvements
+## Future improvements
 
-The modular monolith keeps deployment and review simple while isolating unstable protocol details. Section-level caching and failures reduce upstream load and preserve useful output, at the cost of mixed retrieval times. The generic boundaries are intentionally small; no plugin framework, workflow engine, database, queue, or microservice is introduced.
-
-After verified protocol completion, useful improvements include Redis-backed cache/rate limiting, metrics and alerts for drift/session transitions, fixture variants for optional fields, opt-in live smoke tests in a protected environment, and deployment automation using user-provided Render authorization.
-
-## Required capture to complete the protocol integration
-
-Please provide the first **sanitized** LinkedIn profile-resolution/identity request and matching JSON response. It must remove or replace:
-
-- `cookie`, `csrf-token`, authorization values, account/session identifiers, and sensitive captured headers;
-- real names, profile text, contact information, company/school names, image URLs, and identifiable URNs;
-- tracking values or request identifiers tied to a person/session.
-
-Keep the exact HTTP method, internal path shape, query parameter names, required header names, JSON keys, `$type` discriminators, reference relationships, and value types. If resolution and identity are separate requests, provide both pairs and label them. Do not send a HAR or a cURL command containing live credentials.
+- Redis-backed cache and distributed rate limiting
+- Metrics and alerts for session transitions, latency, and drift
+- More privacy-reviewed fixtures for non-empty optional sections
+- Protected opt-in live smoke-test workflow
+- Automated deployment with explicit operator authorization
+- API-key rotation and multiple API clients
+- Request correlation in upstream telemetry
+- Configurable retention for external cache implementations

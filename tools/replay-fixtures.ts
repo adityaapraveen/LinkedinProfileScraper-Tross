@@ -4,13 +4,15 @@ import {
   type FixtureParserRegistry,
 } from '../src/linkedin/diagnostics/fixture-replay.js';
 
-// Parsers are registered only after a verified sanitized capture defines their response boundary.
+// Register parsers here when a privacy-reviewed sanitized replay fixture is committed.
 const parsers: FixtureParserRegistry = {};
 const root = resolve(process.cwd(), 'fixtures/sanitized');
 const results = await replayFixtures(root, parsers);
 
 if (results.length === 0) {
-  console.log('No sanitized protocol fixtures are present; endpoint parsers remain unsupported.');
+  console.log(
+    'No sanitized replay fixtures are present; parser coverage uses synthetic unit fixtures.',
+  );
 } else {
   for (const result of results) {
     console.log(
